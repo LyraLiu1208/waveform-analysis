@@ -207,7 +207,7 @@ def analyze_material(material_name, base_dir):
         base_dir (str): Base directory of the waveform-analysis project
     
     Returns:
-        dict: Dictionary containing generated waveforms and metadata
+        dict: Dictionary containing generated waveforms and metadata for each participant
     """
     data_dir = os.path.join(base_dir, 'data', material_name)
     sliding_dir = os.path.join(data_dir, 'Sliding_Friction-roughness')
@@ -219,24 +219,29 @@ def analyze_material(material_name, base_dir):
     print(f"Analyzing material: {material_name}")
     print(f"Looking in: {sliding_dir}")
     
-    all_dominant_frequencies = []
-    all_frequency_amplitudes = []
-    participant_data = {}
-    original_data_combined = []
+    participant_results = {}
     
-    # Process each participant's .wav file
+    # Process each participant separately
     for participant_dir in os.listdir(sliding_dir):
         participant_path = os.path.join(sliding_dir, participant_dir)
         
         if not os.path.isdir(participant_path):
             continue
             
+        print(f"\n--- Processing {participant_dir} ---")
+        
         wav_files = [f for f in os.listdir(participant_path) if f.endswith('.wav')]
         
         if not wav_files:
             print(f"  Warning: No .wav files found for {participant_dir}")
             continue
         
+        participant_dominant_frequencies = []
+        participant_frequency_amplitudes = []
+        participant_data = {}
+        participant_original_data = []
+        
+        # Process each wav file for this participant
         for wav_file in wav_files:
             wav_path = os.path.join(participant_path, wav_file)
             
@@ -251,91 +256,101 @@ def analyze_material(material_name, base_dir):
                     'raw_data': data
                 }
                 
-                all_dominant_frequencies.extend(dom_freqs)
-                all_frequency_amplitudes.extend(freq_amps)
+                participant_dominant_frequencies.extend(dom_freqs)
+                participant_frequency_amplitudes.extend(freq_amps)
                 
-                # Combine original data (take a representative segment)
+                # Store original data for this participant (take a representative segment)
                 if len(data) > 0:
                     # Take middle section to avoid start/end artifacts
                     start_idx = len(data) // 4
                     end_idx = 3 * len(data) // 4
                     segment = data[start_idx:end_idx]
-                    original_data_combined.extend(segment[:1000])  # Limit length
+                    participant_original_data.extend(segment[:1000])  # Limit length
                 
             except Exception as e:
                 print(f"    Error processing {wav_path}: {e}")
                 continue
+        
+        if not participant_dominant_frequencies:
+            print(f"  Warning: No dominant frequencies found for {participant_dir}")
+            continue
+        
+        # Create downsampled original waveform for this participant
+        original_waveform = np.array([])
+        if participant_original_data:
+            # Downsample and quantize original data
+            original_combined = np.array(participant_original_data)
+            # Take every nth sample to fit reasonable array size
+            downsample_factor = max(1, len(original_combined) // 160)  # Target ~160 samples
+            downsampled = original_combined[::downsample_factor]
+            # Quantize to 16-bit integers
+            original_waveform = np.round(downsampled * MAX_AMPLITUDE).astype(int)
+            original_waveform = np.clip(original_waveform, -32767, 32767)
+            
+            print(f"  {participant_dir} original waveform: {len(original_waveform)} samples")
+        
+        # Find the most significant frequencies for this participant
+        unique_freqs, freq_counts = np.unique(np.round(participant_dominant_frequencies), return_counts=True)
+        
+        # Sort by frequency of occurrence and amplitude
+        freq_importance = []
+        for freq in unique_freqs:
+            # Find all amplitudes for this frequency
+            freq_mask = np.abs(np.array(participant_dominant_frequencies) - freq) < 2  # 2Hz tolerance
+            avg_amplitude = np.mean([participant_frequency_amplitudes[i] for i, mask in enumerate(freq_mask) if mask])
+            freq_count = np.sum(freq_mask)
+            
+            # Importance score: combination of occurrence and amplitude
+            importance = freq_count * avg_amplitude
+            freq_importance.append((freq, importance, avg_amplitude))
+        
+        # Sort by importance and take top frequencies
+        freq_importance.sort(key=lambda x: x[1], reverse=True)
+        selected_frequencies = [int(freq) for freq, _, _ in freq_importance[:NUM_DOMINANT_FREQS]]
+        
+        print(f"  {participant_dir} selected frequencies: {selected_frequencies} Hz")
+        
+        # Store results for this participant
+        participant_results[participant_dir] = {
+            'material_name': material_name,
+            'participant_name': participant_dir,
+            'selected_frequencies': selected_frequencies,
+            'participant_data': participant_data,
+            'frequency_importance': freq_importance,
+            'original_waveform': original_waveform,
+            'original_data': participant_original_data
+        }
     
-    if not all_dominant_frequencies:
-        print("Error: No dominant frequencies found for this material")
+    if not participant_results:
+        print("Error: No participant data found for this material")
         return None
     
-    # Create downsampled original waveform for C++ array
-    original_waveform = np.array([])
-    if original_data_combined:
-        # Downsample and quantize original data
-        original_combined = np.array(original_data_combined)
-        # Take every nth sample to fit reasonable array size
-        downsample_factor = max(1, len(original_combined) // 160)  # Target ~160 samples
-        downsampled = original_combined[::downsample_factor]
-        # Quantize to 16-bit integers
-        original_waveform = np.round(downsampled * MAX_AMPLITUDE).astype(int)
-        original_waveform = np.clip(original_waveform, -32767, 32767)
-        
-        print(f"Original waveform: {len(original_waveform)} samples")
-    
-    # Find the most common/significant frequencies across all participants
-    unique_freqs, freq_counts = np.unique(np.round(all_dominant_frequencies), return_counts=True)
-    
-    # Sort by frequency of occurrence and amplitude
-    freq_importance = []
-    for freq in unique_freqs:
-        # Find all amplitudes for this frequency
-        freq_mask = np.abs(np.array(all_dominant_frequencies) - freq) < 2  # 2Hz tolerance
-        avg_amplitude = np.mean([all_frequency_amplitudes[i] for i, mask in enumerate(freq_mask) if mask])
-        freq_count = np.sum(freq_mask)
-        
-        # Importance score: combination of occurrence and amplitude
-        importance = freq_count * avg_amplitude
-        freq_importance.append((freq, importance, avg_amplitude))
-    
-    # Sort by importance and take top frequencies
-    freq_importance.sort(key=lambda x: x[1], reverse=True)
-    selected_frequencies = [int(freq) for freq, _, _ in freq_importance[:NUM_DOMINANT_FREQS]]
-    
-    print(f"Selected representative frequencies: {selected_frequencies} Hz")
-    
-    return {
-        'material_name': material_name,
-        'selected_frequencies': selected_frequencies,
-        'participant_data': participant_data,
-        'frequency_importance': freq_importance,
-        'original_waveform': original_waveform,
-        'original_data_combined': original_data_combined
-    }
+    return participant_results
 
-def generate_cpp_output(analysis_result, output_path):
+def generate_cpp_output(participant_result, output_path):
     """
-    Generate C++ header code with waveform arrays.
+    Generate C++ header code with waveform arrays for a single participant.
     
     Args:
-        analysis_result (dict): Result from analyze_material()
+        participant_result (dict): Result from analyze_material() for one participant
         output_path (str): Path to save the output file
     """
-    if not analysis_result:
-        print("Error: No analysis result to generate output from")
+    if not participant_result:
+        print("Error: No participant result to generate output from")
         return
     
-    material_name = analysis_result['material_name']
-    selected_frequencies = analysis_result['selected_frequencies']
-    original_waveform = analysis_result.get('original_waveform', np.array([]))
+    material_name = participant_result['material_name']
+    participant_name = participant_result['participant_name']
+    selected_frequencies = participant_result['selected_frequencies']
+    original_waveform = participant_result.get('original_waveform', np.array([]))
     
-    print(f"\nGenerating C++ arrays for {material_name}...")
+    print(f"\nGenerating C++ arrays for {material_name} - {participant_name}...")
     
     # Start building the C++ code
     cpp_lines = []
     cpp_lines.append("// Auto-generated waveform arrays for haptic feedback")
     cpp_lines.append(f"// Material: {material_name}")
+    cpp_lines.append(f"// Participant: {participant_name}")
     cpp_lines.append(f"// Generated on: {np.datetime64('now')}")
     cpp_lines.append("// Frequencies based on FFT analysis of sliding friction audio")
     cpp_lines.append("")
@@ -348,7 +363,7 @@ def generate_cpp_output(analysis_result, output_path):
     
     # Add original waveform array (downsampled)
     if len(original_waveform) > 0:
-        array_name = f"ORIGINAL_{material_name.upper()}_ARRAY"
+        array_name = f"ORIGINAL_{material_name.upper()}_{participant_name.upper()}_ARRAY"
         cpp_lines.append(format_cpp_array(original_waveform, array_name))
         print(f"  Generated: {array_name} ({len(original_waveform)} samples)")
     
@@ -357,7 +372,7 @@ def generate_cpp_output(analysis_result, output_path):
         # Use equal amplitudes for simplicity
         amplitudes = [1.0] * len(selected_frequencies)
         composite_array = generate_composite_waveform(selected_frequencies, amplitudes)
-        array_name = f"COMPOSITE_{material_name.upper()}_ARRAY"
+        array_name = f"COMPOSITE_{material_name.upper()}_{participant_name.upper()}_ARRAY"
         cpp_lines.append(format_cpp_array(composite_array, array_name))
         print(f"  Generated: {array_name} ({len(composite_array)} samples)")
     
@@ -365,7 +380,7 @@ def generate_cpp_output(analysis_result, output_path):
     generated_arrays = []
     for freq in selected_frequencies:
         if freq > 0:  # Skip invalid frequencies
-            array_name = f"FREQ_{freq}HZ_{material_name.upper()}_ARRAY"
+            array_name = f"FREQ_{freq}HZ_{material_name.upper()}_{participant_name.upper()}_ARRAY"
             sine_array = generate_sine_wave_array(freq)
             cpp_lines.append(format_cpp_array(sine_array, array_name))
             generated_arrays.append((freq, array_name))
@@ -377,7 +392,7 @@ def generate_cpp_output(analysis_result, output_path):
     
     # Add comment with metadata
     cpp_lines.append("/*")
-    cpp_lines.append(f"Material Analysis Summary for {material_name}:")
+    cpp_lines.append(f"Material Analysis Summary for {material_name} - {participant_name}:")
     cpp_lines.append(f"Selected Frequencies: {selected_frequencies} Hz")
     cpp_lines.append("")
     cpp_lines.append("Usage Options:")
@@ -387,7 +402,7 @@ def generate_cpp_output(analysis_result, output_path):
     cpp_lines.append("")
     
     # Add participant data summary
-    participant_data = analysis_result['participant_data']
+    participant_data = participant_result['participant_data']
     for participant, data in participant_data.items():
         cpp_lines.append(f"{participant}:")
         cpp_lines.append(f"  Dominant frequencies: {data['dominant_frequencies']} Hz")
@@ -402,23 +417,24 @@ def generate_cpp_output(analysis_result, output_path):
     print(f"\nC++ arrays saved to: {output_path}")
     print(f"Generated {len(generated_arrays) + 2} waveform arrays total")
 
-def create_analysis_plots(analysis_result, output_dir):
+def create_analysis_plots(participant_result, output_dir):
     """
-    Create visualization plots for the frequency analysis.
+    Create visualization plots for the frequency analysis of a single participant.
     
     Args:
-        analysis_result (dict): Result from analyze_material()
+        participant_result (dict): Result from analyze_material() for one participant
         output_dir (str): Directory to save plots
     """
-    if not analysis_result:
+    if not participant_result:
         return
     
-    material_name = analysis_result['material_name']
-    selected_frequencies = analysis_result['selected_frequencies']
-    original_data = analysis_result.get('original_data_combined', [])
+    material_name = participant_result['material_name']
+    participant_name = participant_result['participant_name']
+    selected_frequencies = participant_result['selected_frequencies']
+    original_data = participant_result.get('original_data', [])
     
     # Create plots in the same directory as the waveform output
-    plots_dir = os.path.join(output_dir, 'waveform', material_name)
+    plots_dir = os.path.join(output_dir, 'waveform', material_name, participant_name)
     os.makedirs(plots_dir, exist_ok=True)
     
     plt.figure(figsize=(15, 10))
@@ -429,13 +445,13 @@ def create_analysis_plots(analysis_result, output_dir):
         original_array = np.array(original_data[:2000])  # Show first 2000 samples
         time_axis = np.arange(len(original_array)) / 44100 * 1000  # Assume 44.1kHz, convert to ms
         plt.plot(time_axis, original_array)
-        plt.title(f'{material_name}: Original Waveform (Time Domain)')
+        plt.title(f'{material_name} - {participant_name}: Original Waveform (Time Domain)')
         plt.xlabel('Time (ms)')
         plt.ylabel('Amplitude')
         plt.grid(True)
     else:
         plt.text(0.5, 0.5, 'No original data available', ha='center', va='center', transform=plt.gca().transAxes)
-        plt.title(f'{material_name}: Original Waveform (Time Domain)')
+        plt.title(f'{material_name} - {participant_name}: Original Waveform (Time Domain)')
     
     # Plot 2: FFT Result (frequency domain)
     plt.subplot(3, 1, 2)
@@ -457,14 +473,14 @@ def create_analysis_plots(analysis_result, output_dir):
                 if freq <= 1000:
                     plt.axvline(x=freq, color='red', linestyle='--', alpha=0.7, label=f'{freq}Hz')
             
-            plt.title(f'{material_name}: FFT Result (Frequency Domain)')
+            plt.title(f'{material_name} - {participant_name}: FFT Result (Frequency Domain)')
             plt.xlabel('Frequency (Hz)')
             plt.ylabel('Magnitude')
             plt.legend()
             plt.grid(True)
     else:
         plt.text(0.5, 0.5, 'No FFT data available', ha='center', va='center', transform=plt.gca().transAxes)
-        plt.title(f'{material_name}: FFT Result (Frequency Domain)')
+        plt.title(f'{material_name} - {participant_name}: FFT Result (Frequency Domain)')
     
     # Plot 3: Processed waveform (composite of dominant frequencies)
     plt.subplot(3, 1, 3)
@@ -493,17 +509,17 @@ def create_analysis_plots(analysis_result, output_dir):
                 plt.plot(time_axis_single, single_extended * 0.3, '--', 
                         color=colors[i % len(colors)], alpha=0.7, label=f'{freq}Hz')
         
-        plt.title(f'{material_name}: Processed Waveform (Composite of Dominant Frequencies)')
+        plt.title(f'{material_name} - {participant_name}: Processed Waveform (Composite of Dominant Frequencies)')
         plt.xlabel('Time (ms)')
         plt.ylabel('Amplitude')
         plt.legend()
         plt.grid(True)
     else:
         plt.text(0.5, 0.5, 'No processed waveform available', ha='center', va='center', transform=plt.gca().transAxes)
-        plt.title(f'{material_name}: Processed Waveform (Composite of Dominant Frequencies)')
+        plt.title(f'{material_name} - {participant_name}: Processed Waveform (Composite of Dominant Frequencies)')
     
     plt.tight_layout()
-    plot_path = os.path.join(plots_dir, f'{material_name}_waveform_analysis.png')
+    plot_path = os.path.join(plots_dir, f'{material_name}_{participant_name}_waveform_analysis.png')
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
     
@@ -526,24 +542,29 @@ def main():
     print("SenseGlove Haptic Waveform Generator")
     print("=" * 60)
     
-    # Analyze the material
-    analysis_result = analyze_material(args.material, base_dir)
+    # Analyze the material (now returns results for each participant)
+    participant_results = analyze_material(args.material, base_dir)
     
-    if not analysis_result:
+    if not participant_results:
         print("Analysis failed. Exiting.")
         return 1
     
-    # Generate C++ output
-    waveform_output_dir = os.path.join(output_dir, 'waveform', args.material)
-    cpp_output_path = os.path.join(waveform_output_dir, f'{args.material}_waveforms.txt')
-    os.makedirs(waveform_output_dir, exist_ok=True)
-    generate_cpp_output(analysis_result, cpp_output_path)
-    
-    # Create analysis plots
-    create_analysis_plots(analysis_result, output_dir)
+    # Process each participant separately
+    for participant_name, participant_result in participant_results.items():
+        print(f"\n{'='*30} {participant_name} {'='*30}")
+        
+        # Generate C++ output for this participant
+        waveform_output_dir = os.path.join(output_dir, 'waveform', args.material, participant_name)
+        cpp_output_path = os.path.join(waveform_output_dir, f'{args.material}_{participant_name}_waveforms.txt')
+        os.makedirs(waveform_output_dir, exist_ok=True)
+        generate_cpp_output(participant_result, cpp_output_path)
+        
+        # Create analysis plots for this participant
+        create_analysis_plots(participant_result, output_dir)
     
     print("\n" + "=" * 60)
     print("Waveform generation completed successfully!")
+    print(f"Generated results for {len(participant_results)} participants")
     print("=" * 60)
     
     return 0
